@@ -407,6 +407,50 @@ python MHKiT_writer.py ../5sa/custom_waves/5sa_custom.hydro.yaml --spectrum_file
 
 ---
 
+### `--direction_file`
+Read the directional spectrum `S(f, θ)` from a local CSV instead of reconstructing it from buoy directional moments. **`--buoy` is not needed.**
+
+Does nothing on its own — pair it with `--partitions`, `--plot_wavedirection` or `--plot_wavedirection_cos`.
+
+**Direction convention** — same as NDBC and MHKiT: the angle represents where waves are **coming from**, measured **clockwise from North**.
+
+| Angle | Meaning |
+|-------|---------|
+| `0`   | waves arriving from the north |
+| `90`  | waves arriving from the east |
+| `180` | waves arriving from the south |
+| `270` | waves arriving from the west |
+
+Layout: a header row of `frequency` followed by the direction bin centres, then one row per frequency. Directions must be uniformly spaced around the full circle. Units are Hz and m²/Hz/deg.
+
+```
+frequency,0,15,30,45, ... ,345
+0.0200,0.000,0.000,0.000,0.000, ... ,0.000
+0.0325,0.012,0.031,0.058,0.042, ... ,0.004
+0.0375,0.104,0.233,0.410,0.288, ... ,0.021
+```
+
+Path may be a bare name (resolved next to the YAML), a relative path, or absolute. When no `--buoy` or `--spectrum_file` are given, the frequency marginal of the file is used as the 1-D spectrum, so wave statistics and the YAML write work as usual.
+
+**Example to write partitions from a custom directional spectrum file:**
+```bash
+python MHKiT_writer.py <../path_to_hydro_yaml/case.hydro.yaml> --direction_file custom_direction.csv --partitions
+```
+
+<img width="1557" height="874" alt="image" src="https://github.com/user-attachments/assets/991cbffd-c879-4652-856e-75ee24122e97" />
+
+
+
+**Check the cos2s fit against a custom directional spectrum without writing to yaml:**
+```bash
+python MHKiT_writer.py ../5sa/custom_waves/5sa_custom.hydro.yaml --direction_file test_direction.csv --plot_wavedirection_cos --partition 2 --spread 3.5 1.0
+```
+
+<img width="1579" height="881" alt="image" src="https://github.com/user-attachments/assets/9c772daa-b298-4031-973d-b17f82b989b6" />
+
+
+---
+
 ### `--elevation_duration` / `--elevation_dt`
 Length and time step of the generated eta record (default = 600 s; dt from the companion `simulation.time_step`)
 
