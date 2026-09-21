@@ -440,8 +440,7 @@ python MHKiT_writer.py <../path_to_hydro_yaml/case.hydro.yaml> --direction_file 
 <img width="1557" height="874" alt="image" src="https://github.com/user-attachments/assets/991cbffd-c879-4652-856e-75ee24122e97" />
 
 
-
-**Check the cos2s fit against a custom directional spectrum without writing to yaml:**
+**Check the cos2s fit against a custom directional spectrum with forced 2 partition spread factors:**
 ```bash
 python MHKiT_writer.py ../5sa/custom_waves/5sa_custom.hydro.yaml --direction_file test_direction.csv --plot_wavedirection_cos --partition 2 --spread 3.5 1.0
 ```
