@@ -91,6 +91,12 @@ parser.add_argument(
     help="Read the custom spectrum from a text file instead of downloading it from a buoy, so --buoy is not needed. Accepts a bare name, a path relative to the YAML directory, or an absolute path. Two layouts are recognised: two rows (frequencies then spectral densities) or two columns (frequency, density) - blank lines and lines starting with # or %% are ignored. Units are Hz and m^2/Hz. Implies --type irregular --spectrum custom."
 )
 parser.add_argument(
+    "--direction_file",
+    type=str,
+    default=None,
+    help="Read the directional spectrum S(f,theta) from a CSV instead of reconstructing it from buoy moments, so --buoy is not needed. Accepts a bare name, a path relative to the YAML directory, or an absolute path. Layout: a header row of 'frequency' followed by the direction bin centres, then one row per frequency. Directions use the same compass convention as MHKiT/NDBC: the bearing the waves come from, measured clockwise from North (0 = from the north, 90 = from the east, 180 = from the south, 270 = from the west). Bins must be uniformly spaced around the full circle; units are Hz and m^2/Hz/deg. Used by --partitions and --plot_wavedirection_cos."
+)
+parser.add_argument(
     "--partitions",
     nargs="?",
     type=int,
@@ -241,30 +247,39 @@ if args.spectrum_file:
     if args.plot_wind is not None:
         parser.error("wind plots need buoy data and cannot be used with --spectrum_file")
 
-if args.buoy is None and not (args.spectrum == "custom" and (args.elevation_file or args.spectrum_file)):
+if args.buoy is None and not (args.spectrum == "custom" and (args.elevation_file or args.spectrum_file)) \
+        and not args.direction_file:
     parser.error("--buoy is required, unless --spectrum custom is reading an existing "
-                 "--elevation_file or a --spectrum_file")
+                 "--elevation_file or a --spectrum_file, or --direction_file supplies "
+                 "the directional spectrum")
 
 if args.partitions is not None:
-    if args.spectrum_file:
-        parser.error("--partitions needs buoy directional data and cannot be used with --spectrum_file")
-    if args.buoy is None:
-        parser.error("--partitions requires --buoy")
+    if args.spectrum_file and not args.direction_file:
+        parser.error("--partitions needs directional data: use --direction_file, or drop --spectrum_file")
+    if args.buoy is None and not args.direction_file:
+        parser.error("--partitions requires --buoy or --direction_file")
     if args.partitions < 0:
         parser.error("--partitions must be 0 (auto) or more")
     args.type = "irregular"
 
 if args.plot_wavedirection is not None:
-    if args.spectrum_file:
-        parser.error("--plot_wavedirection needs buoy directional data and cannot be used with --spectrum_file")
-    if args.buoy is None:
-        parser.error("--plot_wavedirection requires --buoy")
+    if args.spectrum_file and not args.direction_file:
+        parser.error("--plot_wavedirection needs directional data: use --direction_file, "
+                     "or drop --spectrum_file")
+    if args.buoy is None and not args.direction_file:
+        parser.error("--plot_wavedirection requires --buoy or --direction_file")
 
 if args.plot_wavedirection_cos is not None:
-    if args.spectrum_file:
-        parser.error("--plot_wavedirection_cos needs buoy directional data and cannot be used with --spectrum_file")
-    if args.buoy is None:
-        parser.error("--plot_wavedirection_cos requires --buoy")
+    if args.spectrum_file and not args.direction_file:
+        parser.error("--plot_wavedirection_cos needs directional data: use --direction_file, "
+                     "or drop --spectrum_file")
+    if args.buoy is None and not args.direction_file:
+        parser.error("--plot_wavedirection_cos requires --buoy or --direction_file")
+
+if args.direction_file and args.partitions is None and args.plot_wavedirection_cos is None \
+        and args.plot_wavedirection is None:
+    parser.error("--direction_file does nothing on its own; add --partitions, "
+                 "--plot_wavedirection or --plot_wavedirection_cos")
 
 if args.spread is not None:
     if args.partitions is None and args.plot_wavedirection_cos is None:
@@ -700,6 +715,49 @@ def load_spectrum_file(path):
     return freq, dens
 
 
+def load_direction_file(path):
+    """Read a directional spectrum CSV into (freq [Hz], theta [deg], S [m^2/Hz/rad]).
+
+    Header row is 'frequency' followed by the direction bin centres; one row per
+    frequency. Angles follow the MHKiT/NDBC compass convention: the bearing the
+    waves come from, clockwise from North (0 = from N, 90 = from E).
+    The file is per-degree, but everything downstream works per-radian.
+    """
+    table = pd.read_csv(path)
+    if table.shape[1] < 3 or table.shape[0] < 2:
+        raise ValueError("expected a 'frequency' column plus one column per direction bin, "
+                         "and at least two frequency rows")
+    try:
+        theta = np.array([float(c) for c in table.columns[1:]])
+    except ValueError:
+        raise ValueError("the column headers after the first must be numeric direction bin centres")
+
+    freq = table.iloc[:, 0].to_numpy(dtype=float)
+    S = table.iloc[:, 1:].to_numpy(dtype=float)
+    if not np.isfinite(freq).all() or not np.isfinite(S).all():
+        raise ValueError("file contains missing or non-numeric values")
+    if np.any(freq <= 0):
+        raise ValueError("frequencies must be positive")
+    if np.any(S < 0):
+        raise ValueError("spectral densities must be non-negative")
+
+    # Sort into ascending 0-360 so the watershed and the sub-bin peak refinement
+    # see neighbouring directions as adjacent columns
+    theta = theta % 360.0
+    order = np.argsort(theta)
+    theta, S = theta[order], S[:, order]
+    if np.any(np.diff(freq) <= 0):
+        forder = np.argsort(freq)
+        freq, S = freq[forder], S[forder, :]
+
+    steps = np.append(np.diff(theta), 360.0 - theta[-1] + theta[0])
+    if not np.allclose(steps, steps[0], rtol=1e-3):
+        raise ValueError(f"direction bins must be uniformly spaced around the full circle; "
+                         f"got steps {np.round(steps, 3)} deg")
+
+    return freq, theta, S * (180.0 / np.pi)
+
+
 spectrum_from_file = bool(args.spectrum_file)
 custom_freq = custom_S = None
 spectrum_label = None
@@ -735,6 +793,47 @@ if spectrum_from_file:
     print(f"File: {spectrum_file_path}")
     print(f"  {len(custom_freq)} bins, {custom_freq.min():.4f} - {custom_freq.max():.4f} Hz")
     print(f"  Hm0 = {4.0 * np.sqrt(_m0):.4f} m")
+
+dir_freq = dir_thetas = dir_S2 = None
+direction_file_path = None
+
+if args.direction_file:
+    _dir_base = os.path.dirname(os.path.abspath(yaml_file_path)) if yaml_file_path else os.getcwd()
+    direction_file_path = args.direction_file if os.path.isabs(args.direction_file) else \
+        os.path.normpath(os.path.join(_dir_base, args.direction_file))
+    if not os.path.isfile(direction_file_path):
+        alt = os.path.abspath(args.direction_file)
+        if os.path.isfile(alt):
+            direction_file_path = alt
+    if not os.path.isfile(direction_file_path):
+        print(f"ERROR: direction file not found: {args.direction_file}")
+        print(f"       Looked in {_dir_base} and {os.getcwd()}")
+        exit(1)
+
+    try:
+        dir_freq, dir_thetas, dir_S2 = load_direction_file(direction_file_path)
+    except (ValueError, OSError) as e:
+        print(f"ERROR: could not read direction file {direction_file_path}: {e}")
+        exit(1)
+
+    _d_th = np.deg2rad(float(dir_thetas[1] - dir_thetas[0]))
+    _S_marginal = dir_S2.sum(axis=1) * _d_th
+    _m0_dir = float(integrate.trapezoid(_S_marginal, dir_freq))
+    print("=" * 60)
+    print("Directional spectrum from file")
+    print("=" * 60)
+    print(f"File: {direction_file_path}")
+    print(f"  {len(dir_freq)} frequencies ({dir_freq.min():.4f} - {dir_freq.max():.4f} Hz) x "
+          f"{len(dir_thetas)} direction bins ({np.degrees(_d_th):.1f} deg)")
+    print(f"  Hm0 = {4.0 * np.sqrt(_m0_dir):.4f} m")
+
+    # With no buoy and no 1-D file, the frequency marginal stands in for swden so the
+    # wave statistics and YAML paths need no special casing
+    if not buoy_number and not spectrum_from_file:
+        spectrum_from_file = True
+        custom_freq, custom_S = dir_freq, _S_marginal
+        spectrum_label = os.path.basename(direction_file_path)
+        source_title = spectrum_label
 
 # ========== Define spectrum helper functions EARLY (before YAML update) ==========
 
@@ -1446,99 +1545,113 @@ if args.partitions is not None or args.plot_wavedirection_cos is not None:
     print(f"Directional partitions ({'auto' if n_bands is None else n_bands})")
     print("=" * 60)
 
-    dir_year = (dir_year_override if dir_year_override is not None
-                else (selected_years[0] if selected_years else available_years[-1]))
-    try:
-        dir_all = ndbc.request_directional_data(buoy_number, dir_year)
-    except Exception as e:
-        print(f"ERROR: could not fetch directional data for {dir_year}: {e}")
-        exit(1)
-
-    dir_clean = dir_all.dropna(dim='date', how='all')
-    if len(dir_clean.date) == 0:
-        print(f"ERROR: no valid directional data for {dir_year}")
-        exit(1)
-
-    dir_label = str(dir_year)
-    if dir_months:
-        month_names = ', '.join(pd.Timestamp(2000, m, 1).strftime('%b') for m in dir_months)
-        keep = np.isin(pd.DatetimeIndex(dir_clean.date.values).month, dir_months)
-        if not keep.any():
-            print(f"ERROR: no directional records for {month_names} {dir_year}")
+    if args.direction_file:
+        # The file already is S(f,theta); no moments, so no MEM reconstruction needed
+        freq_dir, thetas_deg, S2 = dir_freq, dir_thetas, dir_S2
+        thetas_rad = np.deg2rad(thetas_deg)
+        d_theta = np.deg2rad(float(thetas_deg[1] - thetas_deg[0]))
+        S_dir = S2.sum(axis=1) * d_theta
+        dir_label = os.path.basename(direction_file_path)
+        print(f"  Source: {dir_label} "
+              f"({len(freq_dir)} frequencies x {len(thetas_deg)} directions)")
+        if len(thetas_deg) < 24:
+            print(f"  NOTE: {len(thetas_deg)} direction bins at {np.degrees(d_theta):.0f} deg. "
+                  f"Partition directions are refined sub-bin, but s is fitted against")
+            print(f"        only {len(thetas_deg)} points, so treat the spread as approximate.")
+    else:
+        dir_year = (dir_year_override if dir_year_override is not None
+                    else (selected_years[0] if selected_years else available_years[-1]))
+        try:
+            dir_all = ndbc.request_directional_data(buoy_number, dir_year)
+        except Exception as e:
+            print(f"ERROR: could not fetch directional data for {dir_year}: {e}")
             exit(1)
-        dir_clean = dir_clean.isel(date=np.flatnonzero(keep))
-        dir_label = f"{month_names} {dir_year}"
 
-    if extract_targets:
-        dd = pd.DatetimeIndex(dir_clean.date.values)
-        mask = np.zeros(len(dd), dtype=bool)
-        for t in extract_targets:
-            if t['kind'] == 'range':
-                mask |= (dd >= t['timestamp']) & (dd <= t['end'])
-            elif t['kind'] == 'daily':
-                mask |= (dd.normalize() == t['timestamp'].normalize())
+        dir_clean = dir_all.dropna(dim='date', how='all')
+        if len(dir_clean.date) == 0:
+            print(f"ERROR: no valid directional data for {dir_year}")
+            exit(1)
+
+        dir_label = str(dir_year)
+        if dir_months:
+            month_names = ', '.join(pd.Timestamp(2000, m, 1).strftime('%b') for m in dir_months)
+            keep = np.isin(pd.DatetimeIndex(dir_clean.date.values).month, dir_months)
+            if not keep.any():
+                print(f"ERROR: no directional records for {month_names} {dir_year}")
+                exit(1)
+            dir_clean = dir_clean.isel(date=np.flatnonzero(keep))
+            dir_label = f"{month_names} {dir_year}"
+
+        if extract_targets:
+            dd = pd.DatetimeIndex(dir_clean.date.values)
+            mask = np.zeros(len(dd), dtype=bool)
+            for t in extract_targets:
+                if t['kind'] == 'range':
+                    mask |= (dd >= t['timestamp']) & (dd <= t['end'])
+                elif t['kind'] == 'daily':
+                    mask |= (dd.normalize() == t['timestamp'].normalize())
+                else:
+                    near = dd[np.argmin(np.abs(dd - t['timestamp']))]
+                    if abs((near - t['timestamp']).total_seconds()) < 3600:
+                        mask |= (dd == near)
+            if mask.any():
+                dir_clean = dir_clean.isel(date=np.flatnonzero(mask))
+                labels = [t['label'] for t in extract_targets]
+                dir_label = labels[0] if len(labels) == 1 else f"{labels[0]} ... {labels[-1]}"
             else:
-                near = dd[np.argmin(np.abs(dd - t['timestamp']))]
-                if abs((near - t['timestamp']).total_seconds()) < 3600:
-                    mask |= (dd == near)
-        if mask.any():
-            dir_clean = dir_clean.isel(date=np.flatnonzero(mask))
-            labels = [t['label'] for t in extract_targets]
-            dir_label = labels[0] if len(labels) == 1 else f"{labels[0]} ... {labels[-1]}"
-        else:
-            print(f"  WARNING: no directional records in the selection; using all of {dir_year}")
-    print(f"  Source: {len(dir_clean.date)} directional records ({dir_label})")
+                print(f"  WARNING: no directional records in the selection; using all of {dir_year}")
+        print(f"  Source: {len(dir_clean.date)} directional records ({dir_label})")
 
-    # Average the moments as vectors; averaging the angles directly is wrong
-    _rad = np.deg2rad
-    a1m = (dir_clean['swr1'] * np.cos(_rad(dir_clean['swdir']))).mean(dim='date').values
-    b1m = (dir_clean['swr1'] * np.sin(_rad(dir_clean['swdir']))).mean(dim='date').values
-    a2m = (dir_clean['swr2'] * np.cos(2 * _rad(dir_clean['swdir2']))).mean(dim='date').values
-    b2m = (dir_clean['swr2'] * np.sin(2 * _rad(dir_clean['swdir2']))).mean(dim='date').values
-    S_dir = dir_clean['swden'].mean(dim='date').values
-    freq_dir = dir_clean['frequency'].values
+        # Average the moments as vectors; averaging the angles directly is wrong
+        _rad = np.deg2rad
+        a1m = (dir_clean['swr1'] * np.cos(_rad(dir_clean['swdir']))).mean(dim='date').values
+        b1m = (dir_clean['swr1'] * np.sin(_rad(dir_clean['swdir']))).mean(dim='date').values
+        a2m = (dir_clean['swr2'] * np.cos(2 * _rad(dir_clean['swdir2']))).mean(dim='date').values
+        b2m = (dir_clean['swr2'] * np.sin(2 * _rad(dir_clean['swdir2']))).mean(dim='date').values
+        S_dir = dir_clean['swden'].mean(dim='date').values
+        freq_dir = dir_clean['frequency'].values
 
-    ok = np.isfinite(S_dir) & np.isfinite(a1m) & np.isfinite(b1m)
-    freq_dir, S_dir = freq_dir[ok], S_dir[ok]
-    a1m, b1m, a2m, b2m = a1m[ok], b1m[ok], a2m[ok], b2m[ok]
+        ok = np.isfinite(S_dir) & np.isfinite(a1m) & np.isfinite(b1m)
+        freq_dir, S_dir = freq_dir[ok], S_dir[ok]
+        a1m, b1m, a2m, b2m = a1m[ok], b1m[ok], a2m[ok], b2m[ok]
 
-    thetas_deg = np.arange(0.0, 360.0, 5.0)
-    thetas_rad = np.deg2rad(thetas_deg)
-    d_theta = np.deg2rad(5.0)
+        thetas_deg = np.arange(0.0, 360.0, 5.0)
+        thetas_rad = np.deg2rad(thetas_deg)
+        d_theta = np.deg2rad(5.0)
 
-    def mem_spread(c1, c2, theta):
-        """Lygre & Krogstad maximum-entropy D(theta) from the first two moments.
+        def mem_spread(c1, c2, theta):
+            """Lygre & Krogstad maximum-entropy D(theta) from the first two moments.
 
-        D = sigma / (2*pi*|1 - phi1*e^-i*th - phi2*e^-2i*th|^2) is non-negative by
-        construction and reproduces c1 and c2 exactly, so nothing is clipped here.
-        The 2-term Fourier reconstruction is the one that rings negative when
-        r1 + r2 > 0.5; that is a truncation artifact, not energy.
-        """
-        denom = 1.0 - np.abs(c1) ** 2
-        denom = np.where(np.abs(denom) < 1e-12, 1e-12, denom)
-        phi1 = (c1 - c2 * np.conj(c1)) / denom
-        phi2 = c2 - c1 * phi1
-        sigma = np.real(1.0 - phi1 * np.conj(c1) - phi2 * np.conj(c2))
+            D = sigma / (2*pi*|1 - phi1*e^-i*th - phi2*e^-2i*th|^2) is non-negative by
+            construction and reproduces c1 and c2 exactly, so nothing is clipped here.
+            The 2-term Fourier reconstruction is the one that rings negative when
+            r1 + r2 > 0.5; that is a truncation artifact, not energy.
+            """
+            denom = 1.0 - np.abs(c1) ** 2
+            denom = np.where(np.abs(denom) < 1e-12, 1e-12, denom)
+            phi1 = (c1 - c2 * np.conj(c1)) / denom
+            phi2 = c2 - c1 * phi1
+            sigma = np.real(1.0 - phi1 * np.conj(c1) - phi2 * np.conj(c2))
 
-        # sigma <= 0 means the moment set is not realisable by any distribution,
-        # which vector-averaging across time can in principle produce.
-        n_bad = int(np.sum(sigma <= 0.0))
-        if n_bad:
-            print(f"  WARNING: {n_bad} frequency bin(s) have an inconsistent moment set "
-                  f"(MEM sigma <= 0); their spread is unreliable.")
-        sigma = np.clip(sigma, 1e-12, None)
+            # sigma <= 0 means the moment set is not realisable by any distribution,
+            # which vector-averaging across time can in principle produce.
+            n_bad = int(np.sum(sigma <= 0.0))
+            if n_bad:
+                print(f"  WARNING: {n_bad} frequency bin(s) have an inconsistent moment set "
+                      f"(MEM sigma <= 0); their spread is unreliable.")
+            sigma = np.clip(sigma, 1e-12, None)
 
-        e1 = np.exp(-1j * theta)[None, :]
-        e2 = np.exp(-2j * theta)[None, :]
-        num = sigma[:, None]
-        den = np.abs(1.0 - phi1[:, None] * e1 - phi2[:, None] * e2) ** 2
-        D = num / (2.0 * np.pi * np.clip(den, 1e-12, None))
-        return D / np.clip(D.sum(axis=1, keepdims=True) * d_theta, 1e-30, None)
+            e1 = np.exp(-1j * theta)[None, :]
+            e2 = np.exp(-2j * theta)[None, :]
+            num = sigma[:, None]
+            den = np.abs(1.0 - phi1[:, None] * e1 - phi2[:, None] * e2) ** 2
+            D = num / (2.0 * np.pi * np.clip(den, 1e-12, None))
+            return D / np.clip(D.sum(axis=1, keepdims=True) * d_theta, 1e-30, None)
 
-    c1_f = a1m + 1j * b1m
-    c2_f = a2m + 1j * b2m
-    D_mem = mem_spread(c1_f, c2_f, thetas_rad)
-    S2 = S_dir[:, None] * D_mem          # m^2/Hz/rad on (frequency, direction)
+        c1_f = a1m + 1j * b1m
+        c2_f = a2m + 1j * b2m
+        D_mem = mem_spread(c1_f, c2_f, thetas_rad)
+        S2 = S_dir[:, None] * D_mem          # m^2/Hz/rad on (frequency, direction)
 
     df_dir = np.gradient(freq_dir)
     cell_E = S2 * df_dir[:, None] * d_theta
@@ -1776,9 +1889,9 @@ if args.partitions is not None or args.plot_wavedirection_cos is not None:
               f"{100 * E_p / total_E:.1f}% of energy")
         print(f"    Hs = {Hs:.3f} m   Tp = {Tp:.2f} s   gamma = {gamma_fit:.3f}"
               f"   (peak bin Tp was {Tp_bin:.2f} s)")
-        print(f"    peak direction: {theta_from:.1f} deg FROM (NDBC) "
+        print(f"    peak direction: {theta_from:.1f} deg compass, waves coming from "
               f"-> {direction_deg:.1f} deg sea-stack (toward, CCW from +X)")
-        print(f"    circular mean was {theta_mean:.1f} deg FROM "
+        print(f"    circular mean was {theta_mean:.1f} deg compass "
               f"({abs((theta_mean - theta_from + 180) % 360 - 180):.1f} deg off the peak)")
         if args.spread:
             print(f"    cos2s: s = {s_fit:.2f} (--spread override; the fit gave "
@@ -1804,7 +1917,6 @@ if args.partitions is not None or args.plot_wavedirection_cos is not None:
 
     if args.plot_wavedirection_cos is not None or args.partitions is not None:
         n_theta_ss = int(args.n_theta)
-        _fine = np.linspace(-np.pi, np.pi, 4001)
 
         # Rebuild the full S(f,theta) sea-stack will generate: for each partition a
         # JONSWAP in frequency times a cos2s in direction. This is what the solver
@@ -1832,7 +1944,11 @@ if args.partitions is not None or args.plot_wavedirection_cos is not None:
               f"({'over' if diff[i_w, j_w] > 0 else 'under'}-predicted)")
 
         fig = plt.figure(figsize=(16, 9))
-        TH, FR = np.meshgrid(thetas_rad, freq_dir)
+        # Repeat the first direction column at +360 so the contours close the circle
+        # instead of leaving a blank wedge between the last and first bin
+        thetas_wrap = np.append(thetas_rad, thetas_rad[0] + 2.0 * np.pi)
+        TH, FR = np.meshgrid(thetas_wrap, freq_dir)
+        wrap = lambda a: np.concatenate([a, a[:, :1]], axis=1)
         colors_p = plt.cm.tab10(np.linspace(0, 1, max(len(overlays), 1)))
         # contourf takes its levels from the data range, so vmin/vmax alone do
         # nothing; explicit level arrays are what make the extremes saturate.
@@ -1849,7 +1965,8 @@ if args.partitions is not None or args.plot_wavedirection_cos is not None:
               f"(true extreme {vmax:.1f})")
 
         panels = [
-            ("Measured (MEM)", S2, 'viridis', spec_levels, True),
+            ("Measured (file)" if args.direction_file else "Measured (MEM)",
+             S2, 'viridis', spec_levels, True),
             (f"Reconstructed ({len(partition_specs)} x JONSWAP x cos2s)", S_recon,
              'viridis', spec_levels, True),
             ("Difference (reconstructed - measured)", diff, 'RdBu_r', None, False),
@@ -1857,10 +1974,10 @@ if args.partitions is not None or args.plot_wavedirection_cos is not None:
         for k, (title, field, cmap, levels, show_marks) in enumerate(panels):
             ax = fig.add_subplot(2, 3, k + 1, projection='polar')
             if levels is None:
-                cf = ax.pcolormesh(TH, FR, field, cmap=cmap, shading='auto',
+                cf = ax.pcolormesh(TH, FR, wrap(field), cmap=cmap, shading='auto',
                                    vmin=-vshow, vmax=vshow)
             else:
-                cf = ax.contourf(TH, FR, field, levels=levels, cmap=cmap, extend='both')
+                cf = ax.contourf(TH, FR, wrap(field), levels=levels, cmap=cmap, extend='both')
             ax.set_theta_zero_location('N')
             ax.set_theta_direction(-1)
             ax.set_ylim(0, f_top)
@@ -1885,14 +2002,17 @@ if args.partitions is not None or args.plot_wavedirection_cos is not None:
             axd.plot(thetas_deg, D_c, linewidth=1.8, color=colors[i], linestyle='--',
                      label=f"P{i + 1} cos2s s={s_val:.1f} @ {th0:.0f} deg")
             d_th_ss = 2.0 * np.pi / n_theta_ss
-            C_s = 1.0 / np.trapezoid(np.abs(np.cos(0.5 * _fine)) ** (2.0 * s_val), _fine)
+            # Same normalisation as D_c above, so the samples sit on the dashed curve
+            raw = np.abs(np.cos(0.5 * (thetas_rad - np.deg2rad(th0)))) ** (2.0 * s_val)
+            C_s = 1.0 / max(raw.sum() * d_theta, 1e-30)
             th_ss = np.deg2rad(th0) - np.pi + (np.arange(n_theta_ss) + 0.5) * d_th_ss
             D_ss = C_s * np.abs(np.cos(0.5 * (th_ss - np.deg2rad(th0)))) ** (2.0 * s_val)
             axd.plot(np.degrees(th_ss) % 360.0, D_ss, 'o', markersize=3.5,
-                     color=colors[i], alpha=0.8)
+                     color=colors[i], alpha=0.8,
+                     label=f"P{i + 1} n_theta={n_theta_ss} samples")
         axd.set_xlim(0, 360)
         axd.set_xticks(range(0, 361, 30))
-        axd.set_xlabel("Direction FROM [deg]   (circles = sea-stack n_theta sampling)",
+        axd.set_xlabel("Wave direction [deg compass, waves coming from: 0 = N, 90 = E]",
                        fontsize=10)
         axd.set_ylabel("D [1/rad]", fontsize=10)
         axd.set_title("Directional distribution per partition (normalised: no Hs or gamma)",
@@ -1901,9 +2021,7 @@ if args.partitions is not None or args.plot_wavedirection_cos is not None:
         axd.legend(fontsize=8, ncol=max(1, len(overlays)), loc='upper right')
 
         fig.suptitle(f"{source_title} - Directional Reconstruction ({dir_label}, "
-                     f"{len(partition_specs)} partition(s), n_theta={n_theta_ss})\n"
-                     f"polar: angle = direction FROM, radius = frequency [Hz]; "
-                     f"dashed = partition mean direction",
+                     f"{len(partition_specs)} partition(s), n_theta={n_theta_ss})",
                      fontsize=12)
         plt.tight_layout()
         plt.show()
@@ -3900,7 +4018,51 @@ if args.plot_wind is not None:
 #~~~~~~~~~~~~~~ Plot directional wave spectrum if requested ~~~~~~~~~~~~~~
 
 if args.plot_wavedirection is not None:
-    if selected_years:
+    if args.direction_file:
+        plot_type = args.plot_wavedirection
+        S_deg = dir_S2 * (np.pi / 180.0)        # back to the file's m^2/Hz/deg
+
+        if plot_type == "energy":
+            field = S_deg * dir_freq[:, None]
+            cbar_label, kind = "J/Hz/deg", "Energy"
+        elif plot_type == "spread":
+            row = S_deg.sum(axis=1, keepdims=True)
+            field = np.divide(S_deg, row, out=np.zeros_like(S_deg), where=row > 0)
+            cbar_label, kind = "1/Hz/deg", "Spreading Function"
+        else:
+            field = S_deg
+            cbar_label, kind = "m^2/Hz/deg", "Elevation"
+
+        label = os.path.basename(direction_file_path)
+        print(f"\nPlotting {plot_type} spectrum from {label}...")
+        if len(dir_thetas) < 24:
+            print(f"  NOTE: {len(dir_thetas)} direction bins, so the contours are drawn "
+                  f"from only {len(dir_thetas)} points around the circle.")
+
+        # MHKiT's plot_directional_spectrum rounds its colour levels to ceil(max*10)/10,
+        # which collapses to a single band for spectra this small, so draw it here
+        _th_rad = np.deg2rad(dir_thetas)
+        # Repeat the first direction column at +360 so the contours close the circle
+        TH, FR = np.meshgrid(np.append(_th_rad, _th_rad[0] + 2.0 * np.pi), dir_freq)
+        field = np.concatenate([field, field[:, :1]], axis=1)
+        levels = np.linspace(0.0, float(np.nanmax(field)) or 1e-12, 15)
+        fig = plt.figure(figsize=(8, 7))
+        ax = fig.add_subplot(111, projection='polar')
+        if args.nofill:
+            c = ax.contour(TH, FR, field, levels=levels, cmap='viridis', linewidths=1.5)
+        else:
+            c = ax.contourf(TH, FR, field, levels=levels, cmap='viridis', extend='both')
+        ax.set_theta_zero_location('N')
+        ax.set_theta_direction(-1)
+        plt.colorbar(c, ax=ax, pad=0.10, shrink=0.85, label=f"Spectrum [{cbar_label}]")
+        ax.set_title(f"{label} - {kind} Spectrum\n"
+                     f"angle = direction waves come from (compass, 0 = N, 90 = E), "
+                     f"radius = frequency [Hz]", fontsize=11)
+        plt.tight_layout()
+        plt.show()
+        plt.close()
+        print("Directional spectrum plot displayed")
+    elif selected_years:
         # Use the first selected year for directional spectrum
         dir_year = selected_years[0]
         plot_type = args.plot_wavedirection  # elevation, energy, or spread
@@ -4025,9 +4187,13 @@ if args.plot_wavedirection is not None:
                             ax.clabel(contours, inline=False, fontsize=0)  # Hide labels but keep contours
                             ax.set_theta_zero_location('N')
                             ax.set_theta_direction(-1)
-                            ax.set_title(plot_title)
+                            ax.set_title(f"{plot_title}\nangle = direction waves come from "
+                                         f"(compass, 0 = N, 90 = E), radius = frequency [Hz]",
+                                         fontsize=11)
                         else:
-                            plt.title(plot_title)
+                            plt.title(f"{plot_title}\nangle = direction waves come from "
+                                      f"(compass, 0 = N, 90 = E), radius = frequency [Hz]",
+                                      fontsize=11)
                         
                         plt.show()
                         plt.close()
