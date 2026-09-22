@@ -562,6 +562,20 @@ python MHKiT_writer.py <path_to_hydro_yaml/case.hydro.yaml> --buoy 46050 --parti
 
 ---
 
+### `--save`
+Use --save to save a .png of the figure that is being plotted
+
+Can define the name of the saved figure, or the path to be saved. --save with no input names the figure based on inputs and the default location is the figures folder located in the .yaml path
+
+**Example:**
+```bash
+python MHKiT_writer.py <path_to_hydro_yaml/case/case.hydro.yaml>  --buoy 46050 --date 10-12-2012 --plot_wind --save 
+```
+Saves to case/figures/46050_wind_10_12_2012.png
+
+---
+
+
 ## Small notes 
 
 - **`nfrequencies` is computed** SEA-Stack's DFT eta import only evaluates the orthogonal Fourier frequencies `k/(N·dt)`, and strides — silently dropping energy — if `nfrequencies` is below the in-band bin count. The script sizes it to cover the whole default 0.001–1.0 Hz eta band.
