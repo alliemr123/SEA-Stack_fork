@@ -2,6 +2,7 @@
 import os
 import sys
 import argparse
+import re
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -228,6 +229,13 @@ parser.add_argument(
     nargs="*",
     default=None,
     help="[Optional] One or more times for single measurement extraction. Format: HH:MM in 24-hour format (e.g., 18:30), or a range HH:MM-HH:MM (e.g., 05:20-16:40) which averages every measurement in that window. 24:00 means end of day. Multiple times or ranges are overlaid (e.g., --time 00:00-12:00 12:00-24:00). Each date is combined with each time. NDBC wave data is sampled at :10 and :40 past each hour. If omitted with --date, daily averages are used."
+)
+parser.add_argument(
+    "--save",
+    nargs="?",
+    const="",
+    default=None,
+    help="Save every figure this run produces instead of only showing it. Figures go to a figures/ folder beside the YAML (created if missing) with default names built as <buoy>_<feature>_<date>.png (e.g., 46050_spectrum_10_12_2022.png). Give a bare name to override the name but keep that folder (e.g., --save fig1.png), or give a path to choose the folder too (e.g., --save ../assets/figures/ or --save ../assets/figures/fig1.png). A missing extension becomes .png, missing directories are created, and repeats of the same name get _2, _3 so nothing is overwritten. Relative paths resolve next to the YAML, or the working directory if no YAML was given."
 )
 
 args = parser.parse_args()
@@ -679,6 +687,78 @@ os.environ["SSL_CERT_FILE"] = r"C:\Users\ariley\OneDrive - NREL\Documents\nrel_r
 buoy_number = args.buoy
 yaml_file_path = args.path
 wave_type = args.type
+
+#~~~~~~~~~~~~~~ --save: write every figure on its way to the screen ~~~~~~~~~~~~
+
+# Each plot section sets these before calling plt.show(); they name the file when
+# --save was given without an explicit name.
+plot_feature = "figure"
+plot_period = None
+
+
+def _date_year_tag():
+    """Date piece of the default figure name: MM_DD_YYYY, or YYYY for a whole year."""
+    years = [str(y) for y in (args.year or []) if str(y).isdigit()]
+    if args.date:
+        tags = []
+        for d in args.date:
+            parts = str(d).replace("/", "-").split("-")
+            if len(parts) == 3 and len(parts[0]) == 4:
+                tags.append(f"{parts[1]}_{parts[2]}_{parts[0]}")   # YYYY-MM-DD
+            elif len(parts) == 3:
+                tags.append(f"{parts[0]}_{parts[1]}_{parts[2]}")   # MM-DD-YYYY
+            elif len(parts) == 2:
+                tags.append("_".join(p for p in (parts[0], parts[1], years[0] if years else "") if p))
+            else:
+                tags.append(str(d))
+        return "-".join(tags[:3]) + ("etc" if len(tags) > 3 else "")
+    if years:
+        return "-".join(years[:3]) + ("etc" if len(years) > 3 else "")
+    return ""
+
+
+if args.save is not None:
+    _yaml_dir = os.path.dirname(os.path.abspath(yaml_file_path)) if yaml_file_path else os.getcwd()
+    # Default drop point: a figures/ folder beside the YAML, created on the first save
+    _save_base = os.path.join(_yaml_dir, "figures")
+    _save_arg = args.save.strip()
+    _save_dir = ""
+    _save_name = ""
+    if _save_arg:
+        _resolved = _save_arg if os.path.isabs(_save_arg) else os.path.join(_yaml_dir, _save_arg)
+        if _save_arg.endswith(("/", "\\")) or os.path.isdir(_resolved):
+            _save_dir = _resolved
+        elif os.path.dirname(_save_arg):
+            _save_dir = os.path.dirname(_resolved)
+            _save_name = os.path.basename(_save_arg)
+        else:
+            _save_name = _save_arg
+    _save_period = _date_year_tag()
+    _save_used = {}
+    _plt_show = plt.show
+
+    def _save_then_show(*a, **kw):
+        """Save the current figure under the --save name, then show it as usual."""
+        if _save_name:
+            stem, ext = os.path.splitext(_save_name)
+        else:
+            parts = [str(buoy_number) if buoy_number else "",
+                     plot_feature,
+                     plot_period or _save_period]
+            stem = "_".join(p for p in parts if p) or "figure"
+            stem = re.sub(r"[^\w.-]+", "_", stem)
+            ext = ""
+        ext = ext or ".png"
+        count = _save_used.get(stem, 0) + 1
+        _save_used[stem] = count
+        name = stem if count == 1 else f"{stem}_{count}"
+        path = os.path.normpath(os.path.join(_save_dir or _save_base, name + ext))
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        plt.gcf().savefig(path, dpi=150, bbox_inches="tight")
+        print(f"✓ Figure saved: {path}")
+        _plt_show(*a, **kw)
+
+    plt.show = _save_then_show
 
 #~~~~~~~~~~~~~~ Custom spectrum from a file (no buoy data) ~~~~~~~~~~~~~~~~~~~~~
 
@@ -1944,6 +2024,7 @@ if args.partitions is not None or args.plot_wavedirection_cos is not None:
               f"({'over' if diff[i_w, j_w] > 0 else 'under'}-predicted)")
 
         fig = plt.figure(figsize=(16, 9))
+        plot_feature = "wavedirection_cos"
         # Repeat the first direction column at +360 so the contours close the circle
         # instead of leaving a blank wedge between the last and first bin
         thetas_wrap = np.append(thetas_rad, thetas_rad[0] + 2.0 * np.pi)
@@ -2030,6 +2111,8 @@ if args.partitions is not None or args.plot_wavedirection_cos is not None:
 
 
 #~~~~~~~~~~~~~~ Custom spectrum -> surface elevation time series ~~~~~~~~~~~~~~
+
+plot_feature = "elevation"
 
 # EtaTableWaveField / ComponentSampler::BuildFromEtaFile require one "time:elevation"
 # pair per line, colon delimited, no header and no blank lines.
@@ -2490,6 +2573,7 @@ if (not skip_yaml_update and args.spectrum != "custom"
 #~~~~~~~~~~~~~~ Plot spectrum if requested ~~~~~~~~~~~~~~
 
 # Handle spectrum plotting if requested
+plot_feature = "spectrum"
 if args.plot_spectrum is not None:
     # If in extract_single or extract_daily mode, plot every extracted spectrum
     if extract_single or extract_daily:
@@ -2691,6 +2775,7 @@ if args.plot_spectrum is not None:
 
 #~~~~~~~~~~~~~~ Plot spectrum vs Pierson-Moskowitz if requested ~~~~~~~~~~~~~~
 
+plot_feature = "spectrum_pm"
 if args.plot_spectrum_pm is not None:
     # If in extract_single or extract_daily mode, plot each extracted spectrum with its PM estimate
     if extract_single or extract_daily:
@@ -3105,6 +3190,7 @@ if args.plot_spectrum_pm is not None:
 
 #~~~~~~~~~~~~~~ Plot JONSWAP spectrum if requested ~~~~~~~~~~~~~~
 
+plot_feature = "spectrum_js"
 if args.plot_spectrum_js is not None:
     # If in extract_single or extract_daily mode, plot each extracted spectrum with its own JONSWAP fit
     if extract_single or extract_daily:
@@ -3758,6 +3844,7 @@ def select_records(flag_values):
     return raw[cols], label
 
 
+plot_feature = "wavestats"
 if args.plot_wavestats is not None:
     if spectrum_from_file:
         print("\n--plot_wavestats needs buoy records and is not available with --spectrum_file")
@@ -3862,6 +3949,7 @@ if args.plot_wavestats is not None:
 
 #~~~~~~~~~~~~~~ Plot wind data if requested ~~~~~~~~~~~~~~
 
+plot_feature = "wind"
 if args.plot_wind is not None:
     if len(wind_data) == 0:
         print("\nNo wind data available to plot")
@@ -4017,6 +4105,7 @@ if args.plot_wind is not None:
 
 #~~~~~~~~~~~~~~ Plot directional wave spectrum if requested ~~~~~~~~~~~~~~
 
+plot_feature = "wavedirection"
 if args.plot_wavedirection is not None:
     if args.direction_file:
         plot_type = args.plot_wavedirection
@@ -4206,6 +4295,7 @@ if args.plot_wavedirection is not None:
 
 #~~~~~~~~~~~~~~ Plot environmental contour heatmap if requested ~~~~~~~~~~~~~~
 
+plot_feature = "heatmap"
 if args.plot_heatmap is not None:
     if spectrum_from_file:
         print("\n--plot_heatmap needs buoy records and is not available with --spectrum_file")
